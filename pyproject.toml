@@ -1,0 +1,23 @@
+[project]
+name = "aetiovision"
+version = "0.1.0"
+description = "Synthetic anomalies on real healthy medical images, driven by DICOM / SNOMED CT / LOINC codes"
+requires-python = ">=3.11"
+dependencies = ["mcp>=1.2", "pydantic>=2", "numpy", "pillow", "scipy"]
+
+[project.optional-dependencies]
+llm = ["pydantic-ai-slim[openai,anthropic]"]           # openai client also serves Ollama / vLLM / llama.cpp
+models = ["torch>=2.3", "diffusers>=0.30", "transformers>=4.44", "accelerate", "safetensors"]  # worker processes only
+
+[project.scripts]
+aetio = "aetiovision.main:main"
+
+[dependency-groups]
+dev = ["pytest"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

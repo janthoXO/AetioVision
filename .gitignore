@@ -1,0 +1,14 @@
+venv/
+__pycache__/
+*.py[cod]
+outputs/
+weights/
+.venv/
+data/terminology.db
+data/images/
+data/masks/
+data/raw/
+data/releases/
+out/
+# SNOMED CT + LOINC excerpt for tests: licensed content, regenerate with `uv run python tests/fetch_mock_terminology.py`
+tests/mock_terminology.json

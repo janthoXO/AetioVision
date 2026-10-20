@@ -1,0 +1,669 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AetioVision Pipeline Design</title>
+<style>
+:root {
+  --bg: #fbfaf7; --fg: #1d1d1b; --muted: #66645e; --card: #ffffff; --border: #e3e0d8;
+  --accent: #2f5d8a; --rec-bg: #e3f1e6; --rec-fg: #1f6b35; --warn-bg: #fdf1dc; --warn-fg: #8a5a00;
+  --code-bg: #f3f1ec; --row-hover: #f6f4ef;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #161616; --fg: #e8e6e1; --muted: #a09d96; --card: #1f1f1e; --border: #34332f;
+    --accent: #8ab4e0; --rec-bg: #1f3526; --rec-fg: #8fd6a2; --warn-bg: #3a2e14; --warn-fg: #f0c674;
+    --code-bg: #262624; --row-hover: #262624;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #161616; --fg: #e8e6e1; --muted: #a09d96; --card: #1f1f1e; --border: #34332f;
+  --accent: #8ab4e0; --rec-bg: #1f3526; --rec-fg: #8fd6a2; --warn-bg: #3a2e14; --warn-fg: #f0c674;
+  --code-bg: #262624; --row-hover: #262624;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 1040px; margin: 0 auto; padding: 32px 16px 96px; }
+h1 { font-size: 30px; margin: 0 0 4px; letter-spacing: -0.01em; }
+h2 { font-size: 21px; margin: 48px 0 12px; padding-top: 12px; border-top: 1px solid var(--border); }
+h3 { font-size: 17px; margin: 24px 0 6px; }
+a { color: var(--accent); }
+.sub { color: var(--muted); margin: 0 0 24px; }
+code { font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; background: var(--code-bg); padding: 1px 4px; border-radius: 4px; }
+pre.code { background: var(--code-bg); padding: 12px 14px; border-radius: 8px; overflow-x: auto; font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+pre.code code { background: none; padding: 0; }
+pre.mermaid { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 12px; overflow-x: auto; text-align: center; }
+nav.toc { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 12px 16px; columns: 2 260px; font-size: 14px; }
+nav.toc a { display: block; text-decoration: none; padding: 1px 0; }
+ul, ol { padding-left: 20px; }
+li { margin: 2px 0; }
+.tbl { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 14px; }
+th, td { text-align: left; vertical-align: top; padding: 7px 8px; border-bottom: 1px solid var(--border); }
+th { font-weight: 600; color: var(--muted); font-size: 12.5px; text-transform: uppercase; letter-spacing: 0.03em; }
+tbody tr:hover { background: var(--row-hover); }
+.badge { display: inline-block; font-size: 11px; font-weight: 600; padding: 1px 6px; border-radius: 99px; background: var(--rec-bg); color: var(--rec-fg); margin-left: 4px; vertical-align: 1px; }
+.badge.warn { background: var(--warn-bg); color: var(--warn-fg); }
+.note { background: var(--warn-bg); color: var(--warn-fg); border-radius: 8px; padding: 10px 12px; font-size: 14px; }
+</style>
+</head>
+<body>
+<main>
+
+<h1>AetioVision pipeline design</h1>
+<p class="sub">Medical codes or free text in. Synthetic X-ray / MRI / CT with anomaly out. MCP server first. Hexagonal: every step swappable. v4, implemented 2026-10-05 (changes in section 15).</p>
+
+<nav class="toc">
+  <a href="#goal">1. Goal and scope</a>
+  <a href="#codes">2. Medical codes</a>
+  <a href="#needs">3. What the code resolution needs</a>
+  <a href="#dto">4. Request DTO and domain types</a>
+  <a href="#hex">5. Architecture (hexagon)</a>
+  <a href="#flow">6. Request flows</a>
+  <a href="#steps">7. Step 2 and step 3</a>
+  <a href="#ports">8. Ports and pipeline</a>
+  <a href="#layout">9. Repo layout, env config, uv</a>
+  <a href="#decisions">10. Decision record</a>
+  <a href="#coverage">11. Coverage matrix</a>
+  <a href="#plan">12. Milestones</a>
+  <a href="#risks">13. Risks</a>
+  <a href="#open">14. Open questions</a>
+  <a href="#impl">15. Implementation changes (v4)</a>
+</nav>
+
+<h2 id="goal">1. Goal and scope</h2>
+<ul>
+  <li>Baseline text-to-image models (MediSyn, RoentGen, MINIM) gave weak anomalies. Full-image generation hard to control.</li>
+  <li>New idea: start from <b>real healthy image</b>. Change only <b>masked region</b>. Anatomy stays real, only lesion synthetic.</li>
+  <li>Request = <b>code triple</b>: modality (DICOM) + body site (SNOMED CT) + malformation kind (SNOMED CT morphology). SNOMED finding codes and LOINC radiology codes accepted, resolved to triple automatically.</li>
+  <li>Steps: <b>1</b> text to codes (text endpoint only), <b>resolve</b> codes to triple, <b>2</b> pick healthy template, <b>3</b> pick or find anatomy mask, <b>4</b> inpaint.</li>
+  <li>Interface: MCP (stdio) + CLI. Old CLI kept in <code>baselines/</code> as evaluation baseline.</li>
+</ul>
+<p><b>In scope:</b> 2D only (radiograph or single CT/MRI slice). Research use. Python 3.11+, uv.<br>
+<b>Out of scope (now):</b> 3D volumes, DICOM end-to-end, clinical use, lesion placement (<a href="https://github.com/janthoXO/AetioVision/issues/2">#2</a>), HTTP transport (<a href="https://github.com/janthoXO/AetioVision/issues/1">#1</a>), provenance marking (<a href="https://github.com/janthoXO/AetioVision/issues/3">#3</a>).</p>
+
+<h2 id="codes">2. Medical codes</h2>
+<p>Same code systems as the German Medizininformatik-Initiative (MII) imaging profiles <code>kerndatensatz-bildgebung</code>: modality from DICOM, body site and laterality from SNOMED CT, findings from SNOMED CT clinical finding hierarchy.</p>
+
+<h3>Canonical triple</h3>
+<div class="tbl"><table>
+  <thead><tr><th>Slot</th><th>System</th><th>Allowed codes</th><th>Example</th></tr></thead>
+  <tbody>
+    <tr><td>modality</td><td>DICOM (PS3.16 CID 29 / 33)</td><td><code>DX</code>, <code>CR</code> (both X-ray, CR treated as DX), <code>CT</code>, <code>MR</code></td><td><code>DCM:DX</code></td></tr>
+    <tr><td>body_site</td><td>SNOMED CT</td><td>descendants of Body structure <code>123037004</code></td><td><code>SCT:71341001</code> Bone structure of femur</td></tr>
+    <tr><td>morphology</td><td>SNOMED CT</td><td>descendants of Morphologically abnormal structure <code>49755003</code></td><td><code>SCT:72704001</code> Fracture</td></tr>
+    <tr><td>laterality (optional)</td><td>SNOMED CT</td><td>Left <code>7771000</code>, Right <code>24028007</code>, Bilateral <code>51440002</code></td><td><code>SCT:7771000</code></td></tr>
+  </tbody>
+</table></div>
+
+<h3>Accepted inputs</h3>
+<p>Each input fills one or more slots. Inputs can be mixed. Realistic order = SNOMED finding + LOINC exam code.</p>
+<div class="tbl"><table>
+  <thead><tr><th>Input field</th><th>Code kind</th><th>Fills</th><th>Source in release files</th></tr></thead>
+  <tbody>
+    <tr><td><code>modality</code>, <code>body_site</code>, <code>morphology</code>, <code>laterality</code></td><td>triple codes</td><td>own slot</td><td>validated against SNOMED hierarchy roots</td></tr>
+    <tr><td><code>finding</code></td><td>SNOMED clinical finding / disorder (descendant of <code>404684003</code>)</td><td>body_site, morphology, laterality</td><td>SNOMED attributes Finding site <code>363698007</code>, Associated morphology <code>116676008</code>, Laterality <code>272741003</code> on site</td></tr>
+    <tr><td><code>procedure</code></td><td>LOINC radiology term (RSNA Playbook)</td><td>modality, body_site, laterality</td><td>LOINC parts <code>Rad.Modality.Modality Type</code>, <code>Rad.Anatomic Location.Region Imaged</code> / <code>Imaging Focus</code>, <code>Rad.Anatomic Location.Laterality</code>; part to SNOMED via <code>PartRelatedCodeMapping.csv</code></td></tr>
+    <tr><td><code>instructions</code></td><td>free text</td><td>nothing; goes to inpainter prompt</td><td>-</td></tr>
+  </tbody>
+</table></div>
+
+<h3>Resolution rules</h3>
+<ol>
+  <li><b>Collect.</b> Each input proposes slot values. <code>finding</code>: one role group (site, morphology) per group. <code>procedure</code>: modality + region / focus (focus wins, more specific) + laterality.</li>
+  <li><b>Split laterality.</b> Lateralized site ("Structure of left femur") becomes unlateralized parent + laterality.</li>
+  <li><b>Merge.</b> Two values for one slot: equal or one subsumes the other: keep more specific. Else <code>CodeConflict</code>. Site subsumption walks IS-A <code>116680003</code> + Part of <code>123005000</code>.</li>
+  <li><b>Pick role group.</b> Finding with several groups: keep groups that roll up to supported set. One left: take it. Else <code>AmbiguousCode</code> listing groups.</li>
+  <li><b>Fill gaps (D19).</b> Missing slot with exactly one supported value given other slots: fill, record in <code>assumptions</code>. Else <code>UnsupportedRequest</code> with candidates.</li>
+  <li><b>Roll up.</b> <code>requested</code> triple = most specific codes. <code>supported</code> triple = nearest ancestor-or-self in supported set ("Transverse fracture" to "Fracture", "Femoral shaft" to shaft mask). None: <code>UnsupportedRequest</code> with nearest candidates.</li>
+</ol>
+<p><code>requested</code> feeds the inpainter prompt (specific display names). <code>supported</code> feeds catalog, mask lookup, inpainter choice.</p>
+
+<pre class="mermaid">
+flowchart TD
+  IN["CodeRequest<br/>triple fields, finding, procedure, instructions"] --> V["parse + validate prefixes<br/>DCM, SCT, LOINC"]
+  V --> F{"finding given?"}
+  F -- yes --> FG["SNOMED role groups<br/>finding site + associated morphology"]
+  V --> P{"procedure given?"}
+  P -- yes --> PP["LOINC parts<br/>modality, region or focus, laterality<br/>part to SNOMED via PartRelatedCodeMapping"]
+  V --> TF["explicit triple fields"]
+  FG --> L["split lateralized sites"]
+  PP --> L
+  TF --> L
+  L --> M{"merge per slot<br/>equal or subsumed?"}
+  M -- no --> E1["CodeConflict"]
+  M -- yes --> G{"all slots filled?"}
+  G -- no --> I{"one supported value?"}
+  I -- no --> E2["UnsupportedRequest + candidates"]
+  I -- yes --> R
+  G -- yes --> R["roll up to supported set<br/>nearest ancestor-or-self"]
+  R --> E3{"found?"}
+  E3 -- no --> E2
+  E3 -- yes --> OUT["ResolvedRequest<br/>requested triple, supported triple,<br/>laterality, instructions, seed"]
+</pre>
+
+<h3>Examples</h3>
+<div class="tbl"><table>
+  <thead><tr><th>Input</th><th>Resolved triple</th></tr></thead>
+  <tbody>
+    <tr><td><code>modality=DCM:DX</code>, <code>body_site=</code>femoral shaft code, <code>morphology=SCT:72704001</code>, <code>laterality=SCT:7771000</code>, <code>instructions="transverse, displaced"</code></td><td>as given</td></tr>
+    <tr><td><code>finding=SCT:71620000</code> (Fracture of femur), <code>modality=DCM:DX</code></td><td>DX + femur + Fracture</td></tr>
+    <tr><td><code>finding=SCT:71620000</code> only</td><td>DX filled if femur fracture only supported as DX, else error with candidates</td></tr>
+    <tr><td><code>procedure=LOINC:24725-4</code> (CT Head), <code>morphology=</code>Neoplasm</td><td>CT + head (from LOINC part LP199977-2) + Neoplasm</td></tr>
+    <tr><td><code>procedure=</code>XR femur LOINC code + <code>finding=SCT:71620000</code></td><td>DX from LOINC, femur from both (agree), Fracture from finding</td></tr>
+  </tbody>
+</table></div>
+<p class="note">Codes here partly typed from memory. Check each in SNOMED CT browser / LOINC search before data freezes. "Look up" = no code written on purpose.</p>
+
+<h2 id="needs">3. What the code resolution needs</h2>
+<h3>Downloads</h3>
+<div class="tbl"><table>
+  <thead><tr><th>Source</th><th>Get</th><th>Files used</th><th>License</th></tr></thead>
+  <tbody>
+    <tr><td>SNOMED CT International Edition, RF2</td><td>BfArM affiliate license via MLDS portal (Germany member since 2021, free). German National Edition optional, only adds German terms.</td><td><code>Snapshot/Terminology/</code><br><code>sct2_Concept_Snapshot_INT_*.txt</code><br><code>sct2_Description_Snapshot-en_INT_*.txt</code><br><code>sct2_Relationship_Snapshot_INT_*.txt</code></td><td>Affiliate license, free in Germany, annual usage report. No redistribution: DB stays out of git.</td></tr>
+    <tr><td>LOINC release</td><td>Free account at loinc.org</td><td><code>AccessoryFiles/PartFile/</code><br><code>LoincPartLink_Primary.csv</code><br><code>Part.csv</code><br><code>PartRelatedCodeMapping.csv</code><br><code>LoincTable/Loinc.csv</code> (display names)</td><td>LOINC license, free. Redistribution allowed with notice, still keep out of git.</td></tr>
+    <tr><td>DICOM modalities</td><td>Nothing to download</td><td>4 values in code: <code>Literal["DX", "CR", "CT", "MR"]</code></td><td>Free</td></tr>
+  </tbody>
+</table></div>
+
+<h3>Import script</h3>
+<p><code>uv run aetio import-terminology --snomed DIR --loinc DIR</code> writes <code>data/terminology.db</code> (SQLite, gitignored). Only rows needed:</p>
+<pre class="code"><code>sct_concept   (id, active, fsn, semantic_tag)              -- active concepts, FSN from description file
+sct_isa       (child, parent)                              -- inferred 116680003 IS-A
+sct_attr      (concept, grp, type, value)                  -- types 363698007, 116676008, 272741003, 123005000
+loinc_term    (loinc, long_common_name)                    -- CLASS = RAD only
+loinc_part    (loinc, part_type, part_number, part_name)   -- Rad.Modality.*, Rad.Anatomic Location.*
+loinc_part_sct(part_number, sct)                           -- PartRelatedCodeMapping rows with SNOMED target</code></pre>
+<ul>
+  <li>Ancestors: recursive CTE on <code>sct_isa</code> (+ <code>sct_attr</code> type Part of for sites). No closure table needed.</li>
+  <li>Import prints coverage: share of radiology region / focus parts with SNOMED mapping. Unmapped part at runtime: <code>UnknownCode</code> with part name (no LLM fallback, by decision).</li>
+</ul>
+
+<h3>Hand-written, only these</h3>
+<ul>
+  <li>SNOMED constants: 3 hierarchy roots, 5 attribute ids (listed above).</li>
+  <li>LOINC modality part to DICOM: <code>{"XR": "DX", "CT": "CT", "MR": "MR"}</code>. 3 entries, LOINC does not map modality parts to DICOM <span class="badge warn">verify in PartRelatedCodeMapping</span>.</li>
+  <li>Inpainter capabilities: abstract SNOMED codes each adapter handles, e.g. (DX, bone structure, Fracture). Capability list, not mapping table.</li>
+</ul>
+
+<h2 id="dto">4. Request DTO and domain types</h2>
+<h3>API edge: pydantic (MCP tool args, CLI flags)</h3>
+<pre class="code"><code># api/dto.py
+DCM   = Annotated[str, StringConstraints(pattern=r"^DCM:[A-Z]{2}$")]
+SCT   = Annotated[str, StringConstraints(pattern=r"^SCT:\d{6,18}$")]
+LOINC = Annotated[str, StringConstraints(pattern=r"^LOINC:\d{1,7}-\d$")]
+
+class GenerateFromCodes(BaseModel):
+    """Give a triple, a SNOMED finding, a LOINC procedure, or a mix. Missing slots
+    are filled from the other codes or inferred when only one supported value fits."""
+    model_config = ConfigDict(extra="forbid")
+
+    # canonical triple, each slot optional when another code supplies it
+    modality: DCM | None = None          # DCM:DX
+    body_site: SCT | None = None         # SNOMED body structure
+    morphology: SCT | None = None        # SNOMED morphologic abnormality, the malformation kind
+    laterality: SCT | None = None        # SCT:7771000 left, SCT:24028007 right, SCT:51440002 bilateral
+
+    # pre-coordinated sources, resolved to triple slots
+    finding: SCT | None = None           # clinical finding / disorder, e.g. SCT:71620000 Fracture of femur
+    procedure: LOINC | None = None       # radiology term, e.g. LOINC:24725-4 CT Head
+
+    instructions: str = Field("", max_length=2000)   # free detail for inpainter prompt
+    seed: int | None = Field(None, ge=0)
+
+    @model_validator(mode="after")
+    def _some_code(self) -> "GenerateFromCodes":
+        if not any((self.modality, self.body_site, self.morphology, self.finding, self.procedure)):
+            raise ValueError("give a triple, a SNOMED finding, a LOINC procedure, or a mix")
+        return self
+
+    def to_domain(self) -> CodeRequest: ...          # Code.parse on every field</code></pre>
+<ul>
+  <li>Regex checks shape only. Existence and hierarchy (body structure vs morphology vs finding) checked by resolver against <code>terminology.db</code>.</li>
+  <li>Text endpoint: extractor returns same <code>CodeRequest</code>, triple fields limited to supported set (enum in LLM schema), rest of text in <code>instructions</code>.</li>
+</ul>
+
+<h3>Core: frozen dataclasses</h3>
+<pre class="code"><code># domain/codes.py
+@dataclass(frozen=True)
+class Code:
+    system: Literal["DCM", "SCT", "LOINC"]
+    code: str
+    display: str = field(default="", compare=False)
+
+    @classmethod
+    def parse(cls, curie: str) -> "Code": ...      # "SCT:71341001" -> Code("SCT", "71341001")
+
+    def __str__(self) -> str:
+        return f"{self.system}:{self.code}"
+
+@dataclass(frozen=True)
+class Triple:
+    modality: Code        # DCM
+    body_site: Code       # SCT body structure
+    morphology: Code      # SCT morphologic abnormality
+
+
+# domain/request.py
+@dataclass(frozen=True)
+class CodeRequest:                         # what client sent, unresolved
+    modality: Code | None = None
+    body_site: Code | None = None
+    morphology: Code | None = None
+    laterality: Code | None = None
+    finding: Code | None = None
+    procedure: Code | None = None
+    instructions: str = ""
+    seed: int | None = None
+
+@dataclass(frozen=True)
+class ResolvedRequest:
+    requested: Triple                      # most specific codes from input, for prompt
+    supported: Triple                      # nearest supported ancestors, for catalog / mask / inpainter
+    laterality: Code | None
+    instructions: str
+    seed: int
+    sources: dict[str, str]                # slot -> origin, e.g. "body_site": "finding SCT:71620000"
+    assumptions: list[str]                 # slots filled by inference (D19)</code></pre>
+<p>Errors in <code>domain/errors.py</code>: <code>PipelineError</code> base, <code>InvalidCode</code>, <code>UnknownCode</code>, <code>CodeConflict</code>, <code>AmbiguousCode</code>, <code>UnsupportedRequest</code> (carries candidates), <code>NoTemplate</code>, <code>MaskingFailed</code>, <code>InpaintFailed</code>. MCP maps to <code>isError</code>, CLI to exit code.</p>
+
+<h2 id="hex">5. Architecture (hexagon)</h2>
+<p>Core = <code>domain/</code> + <code>pipeline/</code>. All ports in <code>pipeline/ports.py</code> (D3). Adapters in step dirs. <code>main.py</code> reads env vars, builds pipeline (D4).</p>
+<pre class="mermaid">
+flowchart LR
+  subgraph api["api/ (driving adapters)"]
+    MCP["mcp.py<br/>FastMCP, stdio"]
+    CLI["cli.py"]
+  end
+  subgraph core["domain/ + pipeline/ (pure Python + numpy)"]
+    FT{{"Pipeline.from_text()"}}
+    FC{{"Pipeline.from_codes()"}}
+    RES["resolution.py<br/>codes to triple"]
+    SUP["supported.py<br/>supported set + inpainter choice"]
+    PORTS[/"ports.py<br/>Terminology, CodeExtractor,<br/>TemplateCatalog, AnatomyMasker, Inpainter"/]
+  end
+  subgraph adapters["driven adapters"]
+    A0["terminology/<br/>sqlite"]
+    A1["text_extraction/<br/>llm, rules"]
+    A2["catalog/<br/>sqlite"]
+    A3["masking/<br/>predefined, biomedparse"]
+    A4["inpainting/<br/>procedural, roentgen"]
+  end
+  MAIN["main.py<br/>env vars"]
+  MCP & CLI --> FT & FC
+  FT --> FC
+  FC --> RES & SUP
+  RES & SUP & FC --> PORTS
+  PORTS -.- A0 & A1 & A2 & A3 & A4
+  MAIN -. builds .-> core
+  MAIN -. starts .-> api
+</pre>
+<h3>Import rules</h3>
+<ul>
+  <li><code>domain/</code> imports nothing from project.</li>
+  <li><code>pipeline/</code> imports <code>domain/</code> only. Never adapters.</li>
+  <li>Adapter imports <code>pipeline.ports</code>, <code>domain/</code>, <code>shared/</code>, <code>utils/</code>. Never other step dirs.</li>
+  <li><code>api/</code> imports <code>pipeline/</code> + <code>domain/</code>, gets <code>Pipeline</code> from <code>main.py</code>.</li>
+  <li><code>main.py</code> only place importing concrete adapters, lazily per env value.</li>
+  <li>Model client code lives in adapter using it. Moves to <code>shared/</code> when second adapter needs it.</li>
+</ul>
+
+<h2 id="flow">6. Request flows</h2>
+<pre class="mermaid">
+sequenceDiagram
+  autonumber
+  participant C as MCP client
+  participant A as api/mcp.py
+  participant P as Pipeline
+  participant X as CodeExtractor
+  participant R as resolution + Terminology
+  participant T as TemplateCatalog
+  participant M as AnatomyMasker
+  participant I as Inpainter
+  alt text endpoint
+    C->>A: generate_from_text("AP x-ray left femur, displaced mid-shaft fracture")
+    A->>P: from_text(text, seed)
+    P->>X: extract(text, supported set)
+    X-->>P: CodeRequest(DCM:DX, femoral shaft, Fracture, left, "displaced, mid-shaft")
+  else codes endpoint
+    C->>A: generate_from_codes(finding SCT:71620000, procedure LOINC femur XR, laterality left, instructions)
+    A->>P: from_codes(CodeRequest)
+  end
+  P->>R: resolve(request, supported set)
+  R-->>P: ResolvedRequest(requested + supported triple)
+  P->>T: select(resolved)
+  T-->>P: Template with mask set
+  P->>M: mask(template, supported body site)
+  M-->>P: soft anatomy Mask
+  P->>I: inpaint(template, mask, resolved)
+  I-->>P: MedicalImage
+  P-->>A: Result
+  A->>A: utils.save_result: PNG, mask PNG
+  A-->>C: PNG preview + resolved codes JSON + file paths
+  Note over P,I: each step may raise typed domain error. MCP returns isError with reason.
+</pre>
+
+<h3>MCP tools / CLI commands</h3>
+<div class="tbl"><table>
+  <thead><tr><th>MCP tool</th><th>CLI</th><th>Does</th></tr></thead>
+  <tbody>
+    <tr><td><code>generate_from_codes</code></td><td><code>aetio codes --finding SCT:... --modality DCM:DX ...</code></td><td>Resolve, steps 2-4. Args = <code>GenerateFromCodes</code>.</td></tr>
+    <tr><td><code>generate_from_text</code></td><td><code>aetio text "..."</code></td><td>Step 1, then same. Returns extracted and resolved codes.</td></tr>
+    <tr><td><code>resolve_codes</code></td><td><code>aetio resolve ...</code></td><td>Resolution only, dry run. Shows triple, sources, assumptions.</td></tr>
+    <tr><td><code>list_supported</code></td><td><code>aetio supported</code></td><td>Supported triples with display names.</td></tr>
+    <tr><td>-</td><td><code>aetio import-terminology</code>, <code>aetio catalog add</code></td><td>Admin, CLI only.</td></tr>
+  </tbody>
+</table></div>
+
+<h2 id="steps">7. Step 2 and step 3</h2>
+<h3>Step 2: template selection (catalog, SQLite)</h3>
+<pre class="mermaid">
+flowchart TD
+  A["supported triple + laterality"] --> B["SQL: templates with modality<br/>and mask for supported body site"]
+  B --> D{"laterality match?<br/>or mirror_ok"}
+  D -- none --> G{"fallback masker configured?"}
+  G -- yes --> H["templates with modality<br/>and region containing site"]
+  G -- no --> X["NoTemplate"]
+  D -- some --> F["seeded random pick"]
+  H --> F
+  F --> OUT["Template: image + mask set + license"]
+</pre>
+<pre class="code"><code>-- data/catalog.db (stdlib sqlite3, no server)
+CREATE TABLE template (
+  id TEXT PRIMARY KEY, image TEXT NOT NULL, modality TEXT NOT NULL,   -- DCM:DX
+  region TEXT NOT NULL,                                               -- SCT region code
+  laterality TEXT, view TEXT, mirror_ok INTEGER NOT NULL DEFAULT 0,
+  source TEXT NOT NULL, license TEXT NOT NULL
+);
+CREATE TABLE mask (
+  template_id TEXT NOT NULL REFERENCES template(id),
+  body_site TEXT NOT NULL,                                            -- SCT body structure, one per coded sub-part (D23)
+  path TEXT NOT NULL,
+  PRIMARY KEY (template_id, body_site)
+);</code></pre>
+
+<h3>Step 3: masking</h3>
+<pre class="mermaid">
+flowchart TD
+  A["template + supported body site"] --> B{"mask row for site?"}
+  B -- yes --> M["load predefined mask"]
+  B -- no --> C["fallback model<br/>BiomedParse / TotalSegmentator / ..."]
+  C --> Q{"mask QA: area, components, inside image"}
+  Q -- fail --> X["MaskingFailed"]
+  Q -- ok --> M
+  M --> F["Gaussian feather (D26)"]
+  F --> L["soft anatomy Mask, float 0..1<br/>goes straight to inpainter (no placement, D24)"]
+</pre>
+
+<h2 id="ports">8. Ports and pipeline</h2>
+<pre class="code"><code># pipeline/ports.py
+class Terminology(Protocol):
+    def lookup(self, code: Code) -> Code: ...                               # display filled, UnknownCode if absent
+    def ancestors(self, code: Code) -> list[Code]: ...                      # self first, nearest first (IS-A + Part of)
+    def finding_groups(self, finding: Code) -> list[tuple[Code, Code]]: ... # [(site, morphology)] per role group
+    def split_laterality(self, site: Code) -> tuple[Code, Code | None]: ... # left femur -> (femur, left)
+    def procedure_parts(self, loinc: Code) -> ProcedureParts: ...           # modality, site, laterality
+
+class CodeExtractor(Protocol):
+    def extract(self, text: str, supported: SupportedSet) -> CodeRequest: ...
+
+class TemplateCatalog(Protocol):
+    def coverage(self) -> set[tuple[Code, Code]]: ...                       # (modality, mask body site)
+    def select(self, req: ResolvedRequest) -> Template: ...
+
+class AnatomyMasker(Protocol):
+    def mask(self, template: Template, site: Code) -> Mask: ...
+
+class Inpainter(Protocol):
+    def capabilities(self) -> set[Triple]: ...                              # abstract codes: (DX, bone structure, Fracture)
+    def inpaint(self, template: Template, mask: Mask, req: ResolvedRequest) -> MedicalImage: ...
+
+
+# pipeline/pipeline.py
+@dataclass
+class Pipeline:
+    terminology: Terminology
+    extractor: CodeExtractor
+    catalog: TemplateCatalog
+    masker: AnatomyMasker
+    inpainters: list[Inpainter]                  # order = priority (D27)
+
+    def __post_init__(self) -> None:
+        self.supported = build_supported(self.catalog.coverage(), self.inpainters, self.terminology)
+
+    def from_text(self, text: str, seed: int | None = None) -> Result:
+        return self.from_codes(replace(self.extractor.extract(text, self.supported), seed=seed))
+
+    def from_codes(self, req: CodeRequest) -> Result:
+        resolved = resolve(req, self.terminology, self.supported)
+        template = self.catalog.select(resolved)
+        mask = self.masker.mask(template, resolved.supported.body_site)
+        image = self.supported.inpainter_for(resolved.supported).inpaint(template, mask, resolved)
+        return Result(resolved, template, mask, image)
+
+
+# pipeline/supported.py
+def build_supported(coverage, inpainters, terminology) -> SupportedSet:
+    """Triple (m, site, morph) supported when a template has a mask for (m, site) and an
+    inpainter capability (m, scope, morph) has scope among site's ancestors. First inpainter wins."""</code></pre>
+<ul>
+  <li>Resolution and supported set = pure functions over <code>Terminology</code>. Tested with in-memory fake terminology, no DB.</li>
+  <li>Adapters load models lazily on first <code>inpaint()</code> / <code>mask()</code>. <code>capabilities()</code> cheap.</li>
+  <li>Inpainter builds own prompt: requested display names + laterality + <code>instructions</code>.</li>
+  <li>Pixels float32 in [0, 1], windowing once at template ingestion (D17).</li>
+</ul>
+
+<h2 id="layout">9. Repo layout, env config, uv</h2>
+<pre class="code"><code>AetioVision/
+├─ baselines/                      # old text-to-image CLI, run from inside
+├─ docs/design.html
+├─ PipelineModels.md
+├─ pyproject.toml   uv.lock
+├─ data/
+│  ├─ terminology.db               # gitignored, built by `aetio import-terminology`
+│  ├─ catalog.db                   # tracked, small
+│  ├─ images/                      # gitignored
+│  └─ masks/                       # gitignored, one PNG per (template, body site)
+├─ src/aetiovision/
+│  ├─ main.py                      # env vars -> adapters -> Pipeline, `aetio` entry point
+│  ├─ domain/
+│  │  ├─ codes.py                  # Code, Triple
+│  │  ├─ request.py                # CodeRequest, ResolvedRequest
+│  │  ├─ image.py                  # MedicalImage, Mask
+│  │  ├─ template.py               # Template
+│  │  ├─ result.py                 # Result
+│  │  └─ errors.py
+│  ├─ pipeline/
+│  │  ├─ ports.py                  # all Protocols (D3)
+│  │  ├─ pipeline.py               # Pipeline
+│  │  ├─ resolution.py             # codes -> ResolvedRequest
+│  │  └─ supported.py              # SupportedSet, inpainter choice
+│  ├─ api/
+│  │  ├─ dto.py                    # pydantic GenerateFromCodes
+│  │  ├─ mcp.py                    # FastMCP tools
+│  │  └─ cli.py                    # argparse subcommands
+│  ├─ terminology/
+│  │  ├─ sqlite.py                 # Terminology over terminology.db
+│  │  └─ importer.py               # RF2 + LOINC CSV -> terminology.db
+│  ├─ text_extraction/
+│  │  ├─ llm.py                    # Pydantic AI, provider from EXTRACTION_PROVIDER
+│  │  └─ rules.py                  # synonym match, offline + test
+│  ├─ catalog/
+│  │  └─ sqlite.py
+│  ├─ masking/
+│  │  ├─ predefined.py             # mask table lookup + optional fallback
+│  │  └─ biomedparse.py            # later
+│  ├─ inpainting/
+│  │  ├─ procedural.py             # no-ML baseline, first (D28)
+│  │  └─ roentgen.py               # later
+│  ├─ shared/                      # created when 2+ adapters share model code
+│  └─ utils/                       # image IO, save_result
+└─ tests/
+   ├─ fakes.py                     # fake per port, incl. in-memory Terminology
+   ├─ test_resolution.py
+   ├─ test_pipeline.py
+   ├─ test_contracts.py
+   └─ test_data.py                 # catalog mask codes are SNOMED body structures, etc.</code></pre>
+
+<h3>Env vars (D4, D18)</h3>
+<div class="tbl"><table>
+  <thead><tr><th>Variable</th><th>Values</th><th>Default</th></tr></thead>
+  <tbody>
+    <tr><td><code>AETIO_DATA</code></td><td>path</td><td><code>./data</code></td></tr>
+    <tr><td><code>AETIO_EXTRACTOR</code></td><td><code>rules</code> | <code>llm</code></td><td><code>rules</code></td></tr>
+    <tr><td><code>EXTRACTION_PROVIDER</code></td><td><code>anthropic</code> | <code>openai</code> | <code>ollama</code> | <code>openai_compat</code></td><td><code>anthropic</code></td></tr>
+    <tr><td><code>EXTRACTION_MODEL</code></td><td>model id, e.g. <code>claude-opus-5-5</code>, <code>qwen3:8b</code></td><td><code>claude-opus-5-5</code></td></tr>
+    <tr><td><code>EXTRACTION_URL</code></td><td>local server: Ollama, vLLM, llama.cpp, LM Studio</td><td>unset</td></tr>
+    <tr><td><code>AETIO_MASK_FALLBACK</code></td><td><code>none</code> | <code>biomedparse</code> | ...</td><td><code>none</code></td></tr>
+    <tr><td><code>AETIO_INPAINTERS</code></td><td>ordered comma list, e.g. <code>roentgen,procedural</code></td><td><code>procedural</code></td></tr>
+  </tbody>
+</table></div>
+
+<pre class="code"><code># src/aetiovision/main.py  (only file importing concrete adapters)
+def build() -> Pipeline:
+    env = os.environ
+    data = Path(env.get("AETIO_DATA", "data"))
+    return Pipeline(
+        terminology=SqliteTerminology(data / "terminology.db"),
+        extractor=make_extractor(env.get("AETIO_EXTRACTOR", "rules")),
+        catalog=SqliteCatalog(data / "catalog.db"),
+        masker=PredefinedMasker(fallback=make_mask_fallback(env.get("AETIO_MASK_FALLBACK", "none"))),
+        inpainters=[make_inpainter(n.strip()) for n in env.get("AETIO_INPAINTERS", "procedural").split(",")],
+    )
+
+def make_inpainter(name: str) -> Inpainter:
+    match name:
+        case "procedural":
+            from aetiovision.inpainting.procedural import ProceduralInpainter
+            return ProceduralInpainter()
+        case "roentgen":                                   # torch imported only here
+            from aetiovision.inpainting.roentgen import RoentgenInpainter
+            return RoentgenInpainter()
+    raise SystemExit(f"AETIO_INPAINTERS: unknown inpainter {name!r}")</code></pre>
+
+<pre class="code"><code># pyproject.toml (sketch, single package, D30)
+[project]
+name = "aetiovision"
+requires-python = ">=3.11"
+dependencies = ["mcp>=1.2", "pydantic>=2", "numpy", "pillow", "scipy"]
+
+[project.optional-dependencies]
+llm       = ["pydantic-ai-slim[anthropic,openai]"]      # openai client also serves Ollama / vLLM / llama.cpp
+diffusion = ["torch>=2.3", "diffusers>=0.30", "transformers", "accelerate", "safetensors"]
+
+[project.scripts]
+aetio = "aetiovision.main:main"
+
+[dependency-groups]
+dev = ["pytest"]</code></pre>
+
+<h2 id="decisions">10. Decision record</h2>
+<div class="tbl"><table>
+  <thead><tr><th>ID</th><th>Topic</th><th>Decision</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td>D1</td><td>Legacy CLI dir</td><td><code>baselines/</code> (applied)</td><td>legacy/, t2i_cli/, experiments/</td></tr>
+    <tr><td>D2</td><td>Port style</td><td><code>typing.Protocol</code></td><td>abc.ABC, plain callables</td></tr>
+    <tr><td>D3</td><td>Port location</td><td>all in <code>pipeline/ports.py</code></td><td>port.py per step dir, domain/</td></tr>
+    <tr><td>D4</td><td>Assembly</td><td>env var per step, read in <code>main.py</code></td><td>named profiles, single hard-coded, DI container</td></tr>
+    <tr><td>D5</td><td>Orchestration</td><td>plain Python methods</td><td>LangGraph, Prefect / Hamilton</td></tr>
+    <tr><td>D6</td><td>Type library</td><td>dataclasses in core, pydantic at edges</td><td>pydantic everywhere, attrs</td></tr>
+    <tr><td>D7</td><td>Coordination</td><td>canonical triple; SNOMED finding + LOINC procedure accepted, auto-resolved</td><td>post-coordinated only, pre-coordinated only</td></tr>
+    <tr><td>D8</td><td>Body site</td><td>SNOMED CT body structure</td><td>FMA, UBERON, RadLex, DICOM CID 4031</td></tr>
+    <tr><td>D9</td><td>Malformation kind</td><td>SNOMED CT morphologic abnormality</td><td>ICD-10-GM, ICD-11, RadLex</td></tr>
+    <tr><td>D10</td><td>Modality</td><td>DICOM modality</td><td>LOINC / Playbook (input only), SNOMED procedure, own enum</td></tr>
+    <tr><td>D11</td><td>Code format</td><td>CURIE: <code>DCM:</code>, <code>SCT:</code>, <code>LOINC:</code></td><td>bare codes, FHIR Coding</td></tr>
+    <tr><td>D12</td><td>Terminology storage</td><td>official release files imported to embedded SQLite</td><td>FHIR terminology server, LLM mapping, hand table</td></tr>
+    <tr><td>D13</td><td>Supported set</td><td>derived at startup from catalog masks + inpainter capabilities</td><td>hand-written list, whole vocabulary</td></tr>
+    <tr><td>D14</td><td>API adapters</td><td>MCP + CLI</td><td>+ REST, MCP only</td></tr>
+    <tr><td>D15</td><td>Detail beyond codes</td><td>free <code>instructions</code> only; typed refinement deferred</td><td><a href="https://github.com/janthoXO/AetioVision/issues/2">#2</a></td></tr>
+    <tr><td>D16</td><td>Transport</td><td>stdio, ImageContent preview + file paths</td><td>streamable HTTP: <a href="https://github.com/janthoXO/AetioVision/issues/1">#1</a></td></tr>
+    <tr><td>D17</td><td>Image format</td><td>float32 [0, 1] + meta</td><td>uint8 PNG, raw HU</td></tr>
+    <tr><td>D18</td><td>Text extractor</td><td>LLM via env (<code>EXTRACTION_PROVIDER</code>, ...), hosted + local open models, Pydantic AI; <code>rules</code> fallback</td><td>NER + entity linking</td></tr>
+    <tr><td>D19</td><td>Missing slot</td><td>infer if unique, else error with candidates</td><td>defaults, MCP elicitation</td></tr>
+    <tr><td>D20</td><td>Catalog</td><td>SQLite, embedded (stdlib)</td><td>JSON manifest, embedding rank</td></tr>
+    <tr><td>D21</td><td>Template sources</td><td>open-license sets</td><td>credentialed sets</td></tr>
+    <tr><td>D22</td><td>Mask source</td><td>predefined, model fallback</td><td>predefined only, live model only</td></tr>
+    <tr><td>D23</td><td>Mask granularity</td><td>mask per coded sub-part</td><td>whole structure + geometry, landmarks</td></tr>
+    <tr><td>D24</td><td>Lesion placement</td><td>none in v1, inpainter gets anatomy mask</td><td><a href="https://github.com/janthoXO/AetioVision/issues/2">#2</a></td></tr>
+    <tr><td>D25</td><td>Lesion shape</td><td>deferred with D24</td><td><a href="https://github.com/janthoXO/AetioVision/issues/2">#2</a></td></tr>
+    <tr><td>D26</td><td>Mask softening</td><td>Gaussian feather</td><td>distance ramp, post blend</td></tr>
+    <tr><td>D27</td><td>Inpainter dispatch</td><td>ordered list, capabilities decide</td><td>route table, single model</td></tr>
+    <tr><td>D28</td><td>First inpainter</td><td>procedural baseline</td><td>RoentGen-v2 next</td></tr>
+    <tr><td>D29</td><td>Model hosting</td><td>in-process, lazy</td><td>worker process, remote GPU</td></tr>
+    <tr><td>D30</td><td>Packaging</td><td>single uv package + extras</td><td>workspace, separate projects</td></tr>
+    <tr><td>D31</td><td>Testing</td><td>fakes + contract tests + data tests + leakage invariant</td><td>end-to-end only</td></tr>
+    <tr><td>D32</td><td>Provenance</td><td>none in v1</td><td><a href="https://github.com/janthoXO/AetioVision/issues/3">#3</a></td></tr>
+  </tbody>
+</table></div>
+
+<h2 id="coverage">11. Coverage matrix (target, not promise)</h2>
+<div class="tbl"><table>
+  <thead><tr><th>Modality / region</th><th>Morphology</th><th>Templates</th><th>Masks</th><th>Inpainting</th><th>Gap</th></tr></thead>
+  <tbody>
+    <tr><td><code>DCM:DX</code> extremity</td><td>Fracture</td><td>FracAtlas normal</td><td>MedSAM click per sub-part</td><td>procedural, then SD + LoRA</td><td>Big: no open MSK inpainter.</td></tr>
+    <tr><td><code>DCM:DX</code> thorax</td><td>Neoplasm (nodule), fracture (rib); pneumothorax / effusion if SNOMED morphology exists</td><td>COVID-QU-Ex normal, ChestX-ray14</td><td>TorchXRayVision offline + check</td><td>RoentGen-v2 blend</td><td>Small.</td></tr>
+    <tr><td><code>DCM:MR</code> brain</td><td>Neoplasm</td><td>IXI</td><td>SynthSeg / HD-BET offline</td><td>MONAI DDPM + RePaint</td><td>Medium: BraTS weights non-commercial.</td></tr>
+    <tr><td><code>DCM:CT</code> abdomen</td><td>Neoplasm</td><td>TotalSegmentator dataset</td><td>TotalSegmentator offline</td><td>DiffTumor</td><td>Medium: DiffTumor 3D.</td></tr>
+  </tbody>
+</table></div>
+
+<h2 id="plan">12. Milestones</h2>
+<pre class="mermaid">
+flowchart LR
+  M0["M0 skeleton<br/>domain, ports, resolution,<br/>fakes, env assembly,<br/>MCP + CLI"] --> M1["M1 terminology + first path<br/>import SNOMED + LOINC,<br/>SQLite catalog, femur masks,<br/>procedural inpainter"]
+  M1 --> M2["M2 chest X-ray<br/>RoentGen-v2 blend"]
+  M2 --> M3["M3 extremity fracture<br/>FracAtlas LoRA"]
+  M3 --> M4["M4 brain MRI / CT<br/>MONAI, DiffTumor"]
+  M4 --> M5["M5 evaluation<br/>vs baselines/"]
+</pre>
+<ul>
+  <li><b>M0 exit:</b> <code>aetio codes</code> / <code>aetio text</code> return image with fake adapters. Resolution tests green on fake terminology. MCP tools visible in Claude Desktop.</li>
+  <li><b>M1 exit:</b> <code>finding=SCT:71620000</code> + <code>modality=DCM:DX</code> + left gives procedural fracture on real femur template with shaft mask. Leakage + data tests green.</li>
+</ul>
+
+<h2 id="risks">13. Risks</h2>
+<ul>
+  <li><b>Finding without morphology.</b> Some SNOMED findings have no Associated morphology (pneumothorax, effusion possible). Client then must send <code>morphology</code>. Check per target in M1.</li>
+  <li><b>LOINC part mapping gaps.</b> Not every region part has SNOMED mapping. Import reports coverage; unmapped = typed error.</li>
+  <li><b>SNOMED license.</b> BfArM affiliate license needed before import (TUM may already hold one). Terminology DB never in git.</li>
+  <li><b>Codes typed from memory.</b> Verify in browsers. Data test checks catalog codes exist with right hierarchy.</li>
+  <li><b>MSK X-ray quality.</b> No open fracture inpainter. Procedural first, LoRA next.</li>
+  <li><b>Whole sub-part repainted.</b> No placement in v1 (D24). Keep sub-part masks small; placement in <a href="https://github.com/janthoXO/AetioVision/issues/2">#2</a>.</li>
+  <li><b>Model / data licenses.</b> BiomedParse NC-SA, RoentGen via MIMIC, BraTS NC. Research only.</li>
+</ul>
+
+<h2 id="open">14. Open questions</h2>
+<ul>
+  <li>SNOMED license: own BfArM affiliate license, or TUM institutional one?</li>
+  <li>Default LLM for <code>llm</code> extractor: Claude, or local model first?</li>
+  <li>Priority target after femur fracture?</li>
+  <li>Hardware: M3 only, or GPU cluster?</li>
+</ul>
+
+<h2 id="impl">15. Implementation changes (v4)</h2>
+<p>Changes made while implementing M0 + M1 + a diffusion adapter. Everything else is as above.</p>
+<div class="tbl"><table>
+  <thead><tr><th>ID</th><th>Was</th><th>Now</th><th>Why</th></tr></thead>
+  <tbody>
+    <tr><td>D22'</td><td>predefined masks, model fallback optional (<code>AETIO_MASK_FALLBACK=none</code>)</td><td>predefined masks optional; fallback <code>grounded</code> by default: Qwen3-VL (Ollama) boxes the site name, MedSAM segments the box</td><td>works with no hand-made masks; open weights, Apache-2.0; BiomedParse has no bone targets, SAM 3 is gated and natural-image trained</td></tr>
+    <tr><td>D13'</td><td>supported set = (modality, mask site, morphology)</td><td>plus open rows (modality, template region, morphology): any site whose ancestors include the region and the inpainter scope. Requested site then stays as is (masker finds it)</td><td>follows from D22'; <code>list_supported</code> shows "any Bone structure within Lower limb structure"</td></tr>
+    <tr><td>ports</td><td><code>TemplateCatalog.select() -&gt; Template</code></td><td><code>candidates(req, regions) -&gt; list[Template]</code>; pipeline tries up to 3 until masking succeeds. <code>AnatomyMasker.open_vocabulary()</code>, <code>mask(..., laterality)</code>. <code>Terminology.find/search</code> for text-to-code</td><td>a region template may not show the site; laterality picks the box (patient right = image left)</td></tr>
+    <tr><td>D18'</td><td><code>EXTRACTION_PROVIDER=anthropic</code>, enum of supported codes in the LLM schema</td><td><code>ollama</code> + <code>qwen3:14b</code> (5/5 on eval prompts, thinking off); LLM returns English terms, <code>Terminology.find/search</code> maps them to SNOMED</td><td>local open weights; open-vocabulary sites can't be an enum</td></tr>
+    <tr><td>D29'</td><td>models in-process, lazy</td><td>torch models in worker processes (<code>aetio worker medsam|diffusion</code>, local HTTP, auto-started); LLM/VLM in Ollama</td><td>keeps MCP process light, models swappable and separately hostable</td></tr>
+    <tr><td>D28'</td><td>RoentGen-v2 next</td><td><code>diffusion</code> adapter (SD 1.5 inpainting, MediSyn UNet optional) exists, but gives no recognisable fracture untuned; procedural stays default</td><td>RoentGen-v2 gated (PhysioNet); fracture LoRA (M3) needed</td></tr>
+    <tr><td>leakage</td><td>tested per inpainter</td><td>pipeline blends output into template with the soft mask, so no adapter can leak</td><td>one guard where all inpainters route through</td></tr>
+    <tr><td>data</td><td>codes typed from memory</td><td>mock terminology = real 244-concept excerpt from tx.fhir.org (<code>tests/fetch_mock_terminology.py</code>), imported through the real RF2/LOINC importer</td><td>works before the license; codes verified (femoral shaft is 41111004)</td></tr>
+  </tbody>
+</table></div>
+<p>Open questions answered: default LLM = local (qwen3:14b); hardware = M3 Pro 18 GB, everything runs locally. Still open: SNOMED license channel (UMLS vs BfArM), priority after femur/hand.</p>
+
+</main>
+<script type="module">
+import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+const t = document.documentElement.dataset.theme;
+const dark = t === "dark" || (t !== "light" && matchMedia("(prefers-color-scheme: dark)").matches);
+mermaid.initialize({ startOnLoad: true, theme: dark ? "dark" : "neutral", securityLevel: "strict" });
+</script>
+</body>
+</html>

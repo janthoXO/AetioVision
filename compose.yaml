@@ -1,0 +1,35 @@
+# Ship the app, not the licensed data: ./data (gitignored terminology.db, images, masks) is bind-mounted.
+#   docker compose run --rm aetio supported
+#   docker compose run --rm -i aetio mcp                       # MCP over stdio
+#   docker compose --profile models up -d medsam diffusion     # torch workers (CPU in Docker on macOS: slow)
+# Ollama runs on the host (Metal GPU on macOS) and is reached via host.docker.internal.
+x-env: &env
+  DETECTION_URL: http://host.docker.internal:11434
+  EXTRACTION_URL: http://host.docker.internal:11434/v1
+  MASKING_URL: ${MASKING_URL:-http://medsam:8401}
+  INPAINTING_URL: ${INPAINTING_URL:-http://diffusion:8402}
+  AETIO_EXTRACTOR: ${AETIO_EXTRACTOR:-rules}
+  AETIO_INPAINTERS: ${AETIO_INPAINTERS:-procedural}
+
+services:
+  aetio:
+    build: .
+    image: aetiovision
+    environment: *env
+    volumes: ["./data:/data", "./out:/out"]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+
+  medsam: &worker
+    profiles: [models]
+    build: { context: ., args: { EXTRAS: "--extra models" } }
+    image: aetiovision-models
+    command: ["worker", "medsam"]
+    environment: { AETIO_WORKER_HOST: 0.0.0.0 }
+    volumes: ["hf-cache:/cache/hf"]
+
+  diffusion:
+    <<: *worker
+    command: ["worker", "diffusion"]
+
+volumes:
+  hf-cache:
